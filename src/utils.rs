@@ -171,72 +171,77 @@ pub(crate) fn add_peer_routing(
     debug!("Adding peer routing for interface: {ifname}");
 
     let mut unique_allowed_ips = HashSet::new();
-    let mut default_route = None;
+    let mut default_routes = vec![];
     for peer in peers {
         for addr in &peer.allowed_ips {
             if addr.ip.is_unspecified() {
                 // Handle default route
-                default_route = Some(addr);
-                break;
+                default_routes.push(addr);
+                continue;
             }
             unique_allowed_ips.insert(addr);
         }
     }
+
+    debug!("Default routes that will be used during the peer routing setup: {default_routes:?}");
     debug!("Allowed IPs that will be used during the peer routing setup: {unique_allowed_ips:?}");
 
-    // If there is default route skip adding other routes.
-    if let Some(default_route) = default_route {
-        debug!("Found default route in AllowedIPs: {default_route:?}");
-        let is_ipv6 = default_route.ip.is_ipv6();
-        let proto = if is_ipv6 { "-6" } else { "-4" };
-        debug!("Using the following IP version: {proto}");
+    // If there are default routes
+    if !default_routes.is_empty() {
+        for default_route in default_routes {
+            debug!("Found default route in AllowedIPs: {default_route}");
+            let is_ipv6 = default_route.ip.is_ipv6();
+            let proto = if is_ipv6 { "-6" } else { "-4" };
+            debug!("Using the following IP version: {proto}");
 
-        debug!("Getting current host configuration for interface {ifname}");
-        let mut host = netlink::get_host(ifname)?;
-        debug!("Host configuration read for interface {ifname}");
-        trace!("Current host: {host:?}");
+            debug!("Getting current host configuration for interface {ifname}");
+            let mut host = netlink::get_host(ifname)?;
+            debug!("Host configuration read for interface {ifname}");
+            trace!("Current host: {host:?}");
 
-        debug!("Choosing fwmark for marking WireGuard traffic");
-        let fwmark = match host.fwmark {
-            Some(fwmark) if fwmark != 0 => fwmark,
-            Some(_) | None => {
-                let mut table = DEFAULT_FWMARK_TABLE;
-                loop {
-                    let output = Command::new("ip")
-                        .args([proto, "route", "show", "table", &table.to_string()])
-                        .output()?;
-                    if output.stdout.is_empty() {
-                        host.fwmark = Some(table);
-                        netlink::set_host(ifname, &host)?;
-                        debug!("Assigned fwmark: {table}");
-                        break;
+            debug!("Choosing fwmark for marking WireGuard traffic");
+            let fwmark = match host.fwmark {
+                Some(fwmark) if fwmark != 0 => fwmark,
+                Some(_) | None => {
+                    let mut table = DEFAULT_FWMARK_TABLE;
+                    loop {
+                        let output = Command::new("ip")
+                            .args([proto, "route", "show", "table", &table.to_string()])
+                            .output()?;
+                        if output.stdout.is_empty() {
+                            host.fwmark = Some(table);
+                            netlink::set_host(ifname, &host)?;
+                            debug!("Assigned fwmark: {table}");
+                            break;
+                        }
+                        table += 1;
                     }
-                    table += 1;
+                    table
                 }
-                table
+            };
+
+            debug!("Using the following fwmark for marking WireGuard traffic: {fwmark}");
+
+            // Add routes and table rules
+            debug!("Adding default route: {default_route}");
+            netlink::add_route(ifname, default_route, Some(fwmark))?;
+            debug!("Default route added successfully");
+            debug!("Adding fwmark rule for the WireGuard interface to prevent routing loops");
+            netlink::add_fwmark_rule(default_route, fwmark)?;
+            debug!("Fwmark rule added successfully");
+
+            debug!("Adding rule for main table to suppress current default gateway");
+            netlink::add_main_table_rule(default_route, 0)?;
+            debug!("Main table rule added successfully");
+
+            if !is_ipv6 {
+                debug!("Setting net.ipv4.conf.all.src_valid_mark=1");
+                OpenOptions::new()
+                    .write(true)
+                    .open("/proc/sys/net/ipv4/conf/all/src_valid_mark")?
+                    .write_all(b"1")?;
+                debug!("net.ipv4.conf.all.src_valid_mark=1 set successfully");
             }
-        };
-        debug!("Using the following fwmark for marking WireGuard traffic: {fwmark}");
-
-        // Add routes and table rules
-        debug!("Adding default route: {default_route}");
-        netlink::add_route(ifname, default_route, Some(fwmark))?;
-        debug!("Default route added successfully");
-        debug!("Adding fwmark rule for the WireGuard interface to prevent routing loops");
-        netlink::add_fwmark_rule(default_route, fwmark)?;
-        debug!("Fwmark rule added successfully");
-
-        debug!("Adding rule for main table to suppress current default gateway");
-        netlink::add_main_table_rule(default_route, 0)?;
-        debug!("Main table rule added successfully");
-
-        if !is_ipv6 {
-            debug!("Setting net.ipv4.conf.all.src_valid_mark=1");
-            OpenOptions::new()
-                .write(true)
-                .open("/proc/sys/net/ipv4/conf/all/src_valid_mark")?
-                .write_all(b"1")?;
-            debug!("net.ipv4.conf.all.src_valid_mark=1 set successfully");
         }
     } else {
         for allowed_ip in unique_allowed_ips {
